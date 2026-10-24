@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# test output / scratch
+*.log
+/tmp/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store

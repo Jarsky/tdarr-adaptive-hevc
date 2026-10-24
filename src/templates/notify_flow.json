@@ -1,0 +1,264 @@
+{
+  "_id": "adaptive_hevc_4_notify",
+  "name": "Adaptive HEVC - 4 Notify",
+  "priority": 13,
+  "flowPlugins": [
+    {
+      "name": "Input File",
+      "sourceRepo": "Community",
+      "pluginName": "inputFile",
+      "version": "1.0.0",
+      "inputsDB": {
+        "fileAccessChecks": "false",
+        "pauseNodeIfAccessChecksFail": "false"
+      },
+      "fpEnabled": true,
+      "id": "F4_INPUT",
+      "position": {
+        "x": 760,
+        "y": -1800
+      }
+    },
+    {
+      "name": "Replace Original File",
+      "sourceRepo": "Community",
+      "pluginName": "replaceOriginalFile",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "F4_REPLACE",
+      "position": {
+        "x": 760,
+        "y": -1700
+      }
+    },
+    {
+      "name": "Is TV Shows Library?",
+      "sourceRepo": "Community",
+      "pluginName": "checkFlowVariable",
+      "version": "1.0.0",
+      "inputsDB": {
+        "variable": "{{{args.userVariables.library.library_name}}}",
+        "condition": "==",
+        "value": "TV Shows"
+      },
+      "fpEnabled": true,
+      "id": "F4_CHECK_LIBRARY",
+      "position": {
+        "x": 760,
+        "y": -1600
+      }
+    },
+    {
+      "name": "Notify Sonarr",
+      "sourceRepo": "Community",
+      "pluginName": "notifyRadarrOrSonarr",
+      "version": "2.0.0",
+      "inputsDB": {
+        "arr": "sonarr",
+        "arr_host": "{{{args.userVariables.library.sonarr_url}}}",
+        "arr_api_key": "{{{args.userVariables.library.sonarr_api_key}}}"
+      },
+      "fpEnabled": true,
+      "id": "F4_NOTIFY_SONARR",
+      "position": {
+        "x": 460,
+        "y": -1500
+      }
+    },
+    {
+      "name": "Refresh Plex TV Library",
+      "sourceRepo": "Community",
+      "pluginName": "runClassicTranscodePlugin",
+      "version": "2.0.0",
+      "inputsDB": {
+        "pluginSourceId": "Community:Tdarr_Plugin_goof1_URL_Plex_Refresh",
+        "Plex_Url": "{{{args.userVariables.library.plex_url}}}",
+        "Plex_Token": "{{{args.userVariables.library.plex_token}}}"
+      },
+      "fpEnabled": true,
+      "id": "F4_PLEX_TV",
+      "position": {
+        "x": 460,
+        "y": -1400
+      }
+    },
+    {
+      "name": "Notify Radarr",
+      "sourceRepo": "Community",
+      "pluginName": "notifyRadarrOrSonarr",
+      "version": "2.0.0",
+      "inputsDB": {
+        "arr": "radarr",
+        "arr_host": "{{{args.userVariables.library.radarr_url}}}",
+        "arr_api_key": "{{{args.userVariables.library.radarr_api_key}}}"
+      },
+      "fpEnabled": true,
+      "id": "F4_NOTIFY_RADARR",
+      "position": {
+        "x": 1060,
+        "y": -1500
+      }
+    },
+    {
+      "name": "Refresh Plex Movie Library",
+      "sourceRepo": "Community",
+      "pluginName": "runClassicTranscodePlugin",
+      "version": "2.0.0",
+      "inputsDB": {
+        "pluginSourceId": "Community:Tdarr_Plugin_goof1_URL_Plex_Refresh",
+        "Plex_Url": "{{{args.userVariables.library.plex_url}}}",
+        "Plex_Token": "{{{args.userVariables.library.plex_token}}}",
+        "Library_Key": "{{{args.userVariables.library.plex_library}}}"
+      },
+      "fpEnabled": true,
+      "id": "F4_PLEX_MOVIE",
+      "position": {
+        "x": 1060,
+        "y": -1400
+      }
+    },
+    {
+      "name": "Reset Flow Error",
+      "sourceRepo": "Community",
+      "pluginName": "resetFlowError",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "F4_RESET_ERROR",
+      "position": {
+        "x": 760,
+        "y": -1300
+      }
+    },
+    {
+      "name": "On Flow Error",
+      "sourceRepo": "Community",
+      "pluginName": "onFlowError",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "F4_ERROR_HANDLER",
+      "position": {
+        "x": 1200,
+        "y": -1800
+      }
+    },
+    {
+      "name": "Hard Fail",
+      "sourceRepo": "Community",
+      "pluginName": "failFlow",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "F4_HARD_FAIL",
+      "position": {
+        "x": 1200,
+        "y": -1700
+      }
+    }
+  ],
+  "flowEdges": [
+    {
+      "id": "e4_1",
+      "source": "F4_INPUT",
+      "sourceHandle": "1",
+      "target": "F4_REPLACE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_2",
+      "source": "F4_REPLACE",
+      "sourceHandle": "1",
+      "target": "F4_CHECK_LIBRARY",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_3",
+      "source": "F4_CHECK_LIBRARY",
+      "sourceHandle": "1",
+      "target": "F4_NOTIFY_SONARR",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_4",
+      "source": "F4_CHECK_LIBRARY",
+      "sourceHandle": "2",
+      "target": "F4_NOTIFY_RADARR",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_5",
+      "source": "F4_NOTIFY_SONARR",
+      "sourceHandle": "1",
+      "target": "F4_PLEX_TV",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_6",
+      "source": "F4_NOTIFY_SONARR",
+      "sourceHandle": "2",
+      "target": "F4_PLEX_TV",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_7",
+      "source": "F4_PLEX_TV",
+      "sourceHandle": "1",
+      "target": "F4_RESET_ERROR",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_8",
+      "source": "F4_PLEX_TV",
+      "sourceHandle": "2",
+      "target": "F4_RESET_ERROR",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_9",
+      "source": "F4_NOTIFY_RADARR",
+      "sourceHandle": "1",
+      "target": "F4_PLEX_MOVIE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_10",
+      "source": "F4_NOTIFY_RADARR",
+      "sourceHandle": "2",
+      "target": "F4_PLEX_MOVIE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_11",
+      "source": "F4_PLEX_MOVIE",
+      "sourceHandle": "1",
+      "target": "F4_RESET_ERROR",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_12",
+      "source": "F4_PLEX_MOVIE",
+      "sourceHandle": "2",
+      "target": "F4_RESET_ERROR",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4_err1",
+      "source": "F4_ERROR_HANDLER",
+      "sourceHandle": "1",
+      "target": "F4_HARD_FAIL",
+      "animated": true,
+      "type": "smoothstep"
+    }
+  ],
+  "isUiLocked": false
+}

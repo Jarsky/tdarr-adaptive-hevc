@@ -1,0 +1,1002 @@
+[
+ {
+  "_id": "adaptive_hevc_1_report",
+  "name": "Adaptive HEVC - 1 Report",
+  "priority": 10,
+  "isUiLocked": false,
+  "flowPlugins": [
+   {
+    "name": "Input File",
+    "sourceRepo": "Community",
+    "pluginName": "inputFile",
+    "version": "1.0.0",
+    "inputsDB": {
+     "fileAccessChecks": "false",
+     "pauseNodeIfAccessChecksFail": "false"
+    },
+    "fpEnabled": true,
+    "id": "F1_INPUT",
+    "position": {
+     "x": 760,
+     "y": 0
+    }
+   },
+   {
+    "name": "Skip: Already HEVC?",
+    "sourceRepo": "Community",
+    "pluginName": "checkVideoCodec",
+    "version": "1.0.0",
+    "inputsDB": {
+     "codec": "hevc"
+    },
+    "fpEnabled": true,
+    "id": "F1_CHECK_HEVC",
+    "position": {
+     "x": 760,
+     "y": 130
+    }
+   },
+   {
+    "name": "Skip: Already HEVC",
+    "sourceRepo": "Community",
+    "pluginName": "setOriginalFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F1_SKIP_HEVC",
+    "position": {
+     "x": 1100,
+     "y": 130
+    }
+   },
+   {
+    "name": "Skip: Already AV1?",
+    "sourceRepo": "Community",
+    "pluginName": "checkVideoCodec",
+    "version": "1.0.0",
+    "inputsDB": {
+     "codec": "av1"
+    },
+    "fpEnabled": true,
+    "id": "F1_CHECK_AV1",
+    "position": {
+     "x": 760,
+     "y": 260
+    }
+   },
+   {
+    "name": "Skip: Already AV1",
+    "sourceRepo": "Community",
+    "pluginName": "setOriginalFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F1_SKIP_AV1",
+    "position": {
+     "x": 1100,
+     "y": 260
+    }
+   },
+   {
+    "name": "Source Profile (codec, quality/bpp, HDR/DV, interlace, conform needs)",
+    "sourceRepo": "Community",
+    "pluginName": "customFunction",
+    "version": "1.0.0",
+    "inputsDB": {
+     "code": "// Adaptive HEVC — Source Profile (flow 1, after the HEVC/AV1 checks).\n// Assesses the original before anything is encoded:\n//   - codec family + efficiency, resolution, frame rate, bit depth\n//   - quality as bits-per-pixel (bpp), normalised to H.264-equivalent by codec efficiency\n//   - HDR10 / HLG / Dolby Vision\n//   - conform needs: deinterlace (field_order, else idet on SD/legacy codecs), regenerate timestamps\n//     (AVI / MPEG-PS / TS), even dimensions, audio MKV can't hold (-> FLAC), subtitles to drop\n// Output 1 = encode candidate (variables set), 2 = skip (keep original; reason logged)\nconst { execFile } = require('child_process');\n\n// How efficient each source codec is relative to H.264 (higher = more efficient). Used to scale\n// both the \"is it already lean?\" test and the size targets: MPEG-2 at 25% of its size is about as\n// \"far\" as H.264 at 50%.\nconst EFFICIENCY = { mpeg1video: 0.45, mpeg2video: 0.5, msmpeg4v2: 0.55, msmpeg4v3: 0.6, mpeg4: 0.65, wmv1: 0.6, wmv2: 0.65,\n  wmv3: 0.8, vc1: 0.85, vp8: 0.9, h264: 1.0, vp9: 1.4 };\nconst LEAN_BPP = 0.045;   // H.264-equivalent bits/pixel below which a source is already lean (≈2.5 Mbps 1080p24)\nconst LEGACY = ['mpeg1video', 'mpeg2video', 'mpeg4', 'msmpeg4v2', 'msmpeg4v3', 'wmv1', 'wmv2', 'wmv3', 'vc1'];\nconst MKV_PCM_OK = ['pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_f32le', 'pcm_s16be', 'pcm_u8'];\n\nfunction run(bin, argv) {\n  return new Promise((resolve, reject) => execFile(bin, argv, { maxBuffer: 64 * 1024 * 1024 },\n    (e, out, err) => (e ? reject(Object.assign(e, { stderr: String(err) })) : resolve({ stdout: String(out), stderr: String(err) }))));\n}\nconst num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };\nconst fps = (r) => { const [a, b] = String(r || '0/1').split('/').map(Number); return b ? a / b : 0; };\n\nmodule.exports = async (args) => {\n  const user = (args.variables.user = args.variables.user || {});\n  const log = (m) => args.jobLog(`[source profile] ${m}`);\n  const ffprobe = args.ffProbePath || 'tdarr-ffprobe';\n  const ffmpeg = args.ffmpegPath || 'tdarr-ffmpeg';\n  const file = args.inputFileObj._id;\n  const skip = (why) => { user.report_decision = `skip: ${why}`; log(`SKIP - ${why}`); return { outputFileObj: args.inputFileObj, outputNumber: 2, variables: args.variables }; };\n\n  const info = JSON.parse((await run(ffprobe, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file])).stdout);\n  const streams = info.streams || [];\n  const v = streams.find((s) => s.codec_type === 'video' && !(s.disposition && Number(s.disposition.attached_pic) === 1));\n  if (!v) return skip('no video stream');\n  const codec = v.codec_name;\n  if (['hevc', 'av1'].includes(codec)) return skip(`already ${codec}`);\n  if ((v.side_data_list || []).some((s) => /DOVI/i.test(s.side_data_type || ''))) return skip('Dolby Vision (re-encoding would drop the DV layer)');\n\n  const container = String(info.format.format_name || '');\n  const duration = num(info.format.duration) || num(v.duration);\n  const width = num(v.width); const height = num(v.height);\n  const rate = fps(v.avg_frame_rate) || fps(v.r_frame_rate) || 24;\n  const fileBytes = num(info.format.size);\n  // Video bitrate: per-stream tags (MKV \"BPS\" statistics) can be stale when a tool re-encoded the file\n  // but copied the old tags, so cross-check them against the real size/duration and fall back to\n  // \"total minus the other streams\" when they disagree.\n  const totalKbps = duration ? (fileBytes * 8 / 1000) / duration : 0;\n  const streamKbps = (s) => (num(s.bit_rate) || num(s.tags && (s.tags.BPS || s.tags['BPS-eng']))) / 1000;\n  const otherKbps = Math.min(totalKbps * 0.6, streams.filter((s) => s !== v).reduce((a, s) => a + streamKbps(s), 0));\n  const sizeKbps = Math.max(0, totalKbps - otherKbps);\n  let vKbps = streamKbps(v);\n  if (totalKbps && (!vKbps || vKbps > totalKbps * 1.05 || vKbps < sizeKbps * 0.6)) {\n    if (vKbps) log(`video bitrate tag ${vKbps.toFixed(0)} kbps disagrees with the file size (~${sizeKbps.toFixed(0)} kbps); using the size-based figure`);\n    vKbps = sizeKbps;\n  }\n  const eff = EFFICIENCY[codec] || 0.8;\n  const bpp = width && height && rate && vKbps ? (vKbps * 1000) / (width * height * rate) : 0;\n  const effBpp = bpp * eff;\n  const quality = !bpp ? 'unknown' : effBpp >= 0.25 ? 'high (remux/disc-like)' : effBpp >= 0.08 ? 'standard' : effBpp >= LEAN_BPP ? 'lean' : 'very lean';\n  const transfer = v.color_transfer || '';\n  const hdr = transfer === 'smpte2084' ? 'HDR10' : transfer === 'arib-std-b67' ? 'HLG' : 'SDR';\n  log(`${codec} (${v.profile || '?'}, ${v.pix_fmt || '?'}) ${width}x${height} @ ${rate.toFixed(3)} fps in ${container}, ${(duration / 60).toFixed(1)} min`);\n  log(`video ${vKbps.toFixed(0)} kbps = ${bpp.toFixed(3)} bpp (x${eff} efficiency = ${effBpp.toFixed(3)} H.264-equiv) -> quality: ${quality} | ${hdr}`);\n  if (duration < 20) return skip('shorter than 20 s');\n  if (bpp && effBpp < LEAN_BPP) return skip(`already lean (${effBpp.toFixed(3)} H.264-equiv bpp < ${LEAN_BPP}); re-encoding would mostly cost quality`);\n\n  // ── conform needs ─────────────────────────────────────────────────────────\n  const filters = [];\n  let interlaced = ['tt', 'bb', 'tb', 'bt'].includes(v.field_order);\n  let how = `field_order=${v.field_order || 'unset'}`;\n  if (!interlaced && (LEGACY.includes(codec) || height <= 576) && duration > 60) {\n    try {   // idet over ~600 frames from a quarter of the way in\n      const { stderr } = await run(ffmpeg, ['-hide_banner', '-nostats', '-ss', String(Math.floor(duration * 0.25)), '-i', file,\n        '-map', '0:v:0', '-frames:v', '600', '-vf', 'idet', '-an', '-sn', '-f', 'null', '-']);\n      const m = stderr.match(/Multi frame detection: TFF:\\s*(\\d+) BFF:\\s*(\\d+) Progressive:\\s*(\\d+)/);\n      if (m) {\n        const [tff, bff, prog] = m.slice(1).map(Number);\n        interlaced = (tff + bff) > 0.3 * (tff + bff + prog);\n        how = `idet TFF ${tff} / BFF ${bff} / progressive ${prog}`;\n      }\n    } catch (e) { how += ' (idet failed)'; }\n  }\n  if (interlaced) filters.push('bwdif=mode=send_frame:parity=auto:deint=all');\n  if (width % 2 || height % 2) filters.push('crop=trunc(iw/2)*2:trunc(ih/2)*2');\n  const genpts = /avi|mpeg|mpegts|vob|asf/.test(container);\n  const audioFlac = streams.filter((s) => s.codec_type === 'audio' && /^pcm_/.test(s.codec_name) && !MKV_PCM_OK.includes(s.codec_name)).map((s) => s.index);\n\n  user.src_codec = codec;\n  user.src_efficiency = String(eff);\n  user.src_kbps = String(Math.round(vKbps));\n  user.src_bpp = bpp.toFixed(4);\n  user.src_height = String(height);\n  user.src_bytes = String(fileBytes);\n  user.src_video_bytes = String(Math.round((vKbps * 1000 / 8) * duration) || Math.round(fileBytes * 0.85));\n  user.src_duration = String(duration);\n  user.src_audio_count = String(streams.filter((s) => s.codec_type === 'audio').length);\n  user.is_hdr = hdr === 'SDR' ? 'false' : 'true';\n  user.hdr_type = hdr;\n  user.conform_filter = filters.join(',');\n  user.conform_genpts = genpts ? 'true' : 'false';\n  user.conform_audio_flac = audioFlac.join(',');\n  log(`conform: interlaced=${interlaced} (${how}) | filters: ${user.conform_filter || 'none'} | regenerate timestamps: ${genpts} | audio->FLAC: ${user.conform_audio_flac || 'none'}`);\n  return { outputFileObj: args.inputFileObj, outputNumber: 1, variables: args.variables };\n};\n"
+    },
+    "fpEnabled": true,
+    "id": "F1_PROFILE",
+    "position": {
+     "x": 760,
+     "y": 390
+    }
+   },
+   {
+    "name": "Skip: Lean / DV / Too Short",
+    "sourceRepo": "Community",
+    "pluginName": "setOriginalFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F1_SKIP_PROFILE",
+    "position": {
+     "x": 1100,
+     "y": 390
+    }
+   },
+   {
+    "name": "Library v8_encoder = gpu?",
+    "sourceRepo": "Community",
+    "pluginName": "checkFlowVariable",
+    "version": "1.0.0",
+    "inputsDB": {
+     "variable": "{{{args.userVariables.library.v8_encoder}}}",
+     "condition": "==",
+     "value": "gpu"
+    },
+    "fpEnabled": true,
+    "id": "F1_WANT_GPU",
+    "position": {
+     "x": 760,
+     "y": 520
+    }
+   },
+   {
+    "name": "GPU: Node Has NVENC?",
+    "sourceRepo": "Community",
+    "pluginName": "checkNodeHardwareEncoder",
+    "version": "1.0.0",
+    "inputsDB": {
+     "hardwareEncoder": "hevc_nvenc"
+    },
+    "fpEnabled": true,
+    "id": "F1_CHECK_NVENC",
+    "position": {
+     "x": 480,
+     "y": 650
+    }
+   },
+   {
+    "name": "GPU Path: encoder = hevc_nvenc",
+    "sourceRepo": "Community",
+    "pluginName": "setFlowVariable",
+    "version": "1.0.0",
+    "inputsDB": {
+     "variable": "encoder",
+     "value": "hevc_nvenc"
+    },
+    "fpEnabled": true,
+    "id": "F1_SET_GPU",
+    "position": {
+     "x": 480,
+     "y": 780
+    }
+   },
+   {
+    "name": "CPU Path: encoder = libx265",
+    "sourceRepo": "Community",
+    "pluginName": "setFlowVariable",
+    "version": "1.0.0",
+    "inputsDB": {
+     "variable": "encoder",
+     "value": "libx265"
+    },
+    "fpEnabled": true,
+    "id": "F1_SET_CPU",
+    "position": {
+     "x": 1040,
+     "y": 780
+    }
+   },
+   {
+    "name": "Quality Report (sample encodes -> CRF/CQ, or skip)",
+    "sourceRepo": "Community",
+    "pluginName": "customFunction",
+    "version": "1.0.0",
+    "inputsDB": {
+     "code": "// Adaptive HEVC — Quality Report (flow 1, after Source Profile and the CPU/GPU choice).\n// Finds the encoder quality value (x265 CRF, or NVENC CQ) for THIS file by test-encoding samples:\n//   1. cut 3 short samples spread through the file (stream copy)\n//   2. encode them with the real settings (encoder, preset, 10-bit, conform filters)\n//   3. measure size vs the source samples and SSIM (vs the source run through the same filters)\n//   4. search toward the target size (log-size model, refit from measurements), never below the\n//      SSIM floor and never shrinking further than the minimum; skip if not worth encoding\n// Size rules are for the WHOLE FILE, the same for every source type: aim for 50% of the original,\n// never below 40%, skip if it can't get under 80%. Audio/subtitles are copied, so each file's rule is\n// converted to a video-stream target from how much of the file is video.\n// Output 1 = encode (encode_quality etc. set), 2 = skip (keep original; reason logged)\nconst { execFile } = require('child_process');\nconst fs = require('fs');\nconst path = require('path');\n\nconst DEFAULTS = { fileTarget: 0.50, fileMin: 0.40, fileMax: 0.80, ssimFloor: 0.975, maxRounds: 5 };\nconst ENCODERS = {\n  libx265: { label: 'x265 CRF', lo: 16, hi: 34, ref28Kbps: 2300 },\n  hevc_nvenc: { label: 'NVENC CQ', lo: 18, hi: 38, ref28Kbps: 2900 },   // NVENC needs ~1-2 more CQ for the same size\n};\n\nfunction run(bin, argv) {\n  return new Promise((resolve, reject) => execFile(bin, argv, { maxBuffer: 64 * 1024 * 1024 },\n    (e, out, err) => (e ? reject(Object.assign(e, { stderr: String(err).slice(-2000) })) : resolve({ stdout: String(out), stderr: String(err) }))));\n}\nconst num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };\nfunction userVar(args, name, dflt) {\n  const lib = (args.userVariables && args.userVariables.library) || {};\n  const glob = (args.userVariables && args.userVariables.global) || {};\n  const val = lib[name] !== undefined && lib[name] !== '' ? lib[name] : glob[name];\n  const n = parseFloat(val);\n  return Number.isFinite(n) ? n : dflt;\n}\n\nasync function firstFrameSideData(ffprobe, file) {\n  try {\n    const { stdout } = await run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-print_format', 'json',\n      '-show_frames', '-read_intervals', '%+#1', '-show_entries', 'frame=side_data_list', file]);\n    const f = (JSON.parse(stdout).frames || [])[0];\n    return (f && f.side_data_list) || [];\n  } catch (e) { return []; }\n}\n\n// x265 HDR10 / HLG parameters so the encode keeps the colour metadata\nfunction hdrParams(v, side) {\n  const transfer = v.color_transfer || '';\n  if (transfer !== 'smpte2084' && transfer !== 'arib-std-b67') return [];\n  const p = [`colorprim=${v.color_primaries || 'bt2020'}`, `transfer=${transfer}`,\n    `colormatrix=${v.color_space === 'bt2020c' ? 'bt2020c' : 'bt2020nc'}`, 'repeat-headers=1'];\n  if (transfer === 'smpte2084') {\n    p.push('hdr10=1', 'hdr10-opt=1');\n    const md = side.find((s) => /Mastering display/i.test(s.side_data_type || ''));\n    const cl = side.find((s) => /Content light/i.test(s.side_data_type || ''));\n    const r = (x) => { const [a, b] = String(x || '0/1').split('/').map(Number); return b ? a / b : 0; };\n    if (md && md.red_x) {\n      const c = (x) => Math.round(r(x) * 50000); const l = (x) => Math.round(r(x) * 10000);\n      p.push(`master-display=G(${c(md.green_x)},${c(md.green_y)})B(${c(md.blue_x)},${c(md.blue_y)})R(${c(md.red_x)},${c(md.red_y)})WP(${c(md.white_point_x)},${c(md.white_point_y)})L(${l(md.max_luminance)},${l(md.min_luminance)})`);\n    }\n    if (cl) p.push(`max-cll=${cl.max_content || 0},${cl.max_average || 0}`);\n  }\n  return p;\n}\n\n// The encoder arguments used for BOTH the samples and the real encode (build_encode.js mirrors this)\nfunction videoArgs(encoder, q, x265Params, vKbps) {\n  if (encoder === 'hevc_nvenc') {\n    const a = ['-c:v', 'hevc_nvenc', '-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-cq', String(q), '-b:v', '0',\n      '-profile:v', 'main10', '-pix_fmt', 'p010le'];\n    if (vKbps) a.push('-maxrate', `${Math.round(vKbps)}k`, '-bufsize', `${Math.round(vKbps * 2)}k`);\n    return a;\n  }\n  return ['-c:v', 'libx265', '-preset', 'slow', '-crf', String(q), '-pix_fmt', 'yuv420p10le', '-profile:v', 'main10',\n    '-x265-params', ['log-level=error', ...x265Params].join(':')];\n}\n\nmodule.exports = async (args) => {\n  const user = (args.variables.user = args.variables.user || {});\n  const log = (m) => args.jobLog(`[quality report] ${m}`);\n  const ffmpeg = args.ffmpegPath || 'tdarr-ffmpeg';\n  const ffprobe = args.ffProbePath || 'tdarr-ffprobe';\n  const file = args.inputFileObj._id;\n  const skip = (why) => { user.report_decision = `skip: ${why}`; log(`SKIP - ${why}`); return { outputFileObj: args.inputFileObj, outputNumber: 2, variables: args.variables }; };\n  if (!user.src_codec) throw new Error('Source Profile has not run (src_codec unset)');\n\n  // encoder: chosen by the CPU/GPU branch; HDR always goes to x265 so its metadata survives\n  let encoder = user.encoder === 'hevc_nvenc' ? 'hevc_nvenc' : 'libx265';\n  if (encoder === 'hevc_nvenc' && user.is_hdr === 'true') { encoder = 'libx265'; log(`${user.hdr_type} source: using CPU x265 instead of NVENC to keep HDR metadata`); }\n  user.encoder = encoder;\n  const enc = ENCODERS[encoder];\n\n  // whole-file rules -> video-stream targets (non-video bytes are copied unchanged)\n  const fileTarget = userVar(args, 'v8_target_ratio', DEFAULTS.fileTarget);\n  const fileMin = userVar(args, 'v8_min_ratio', DEFAULTS.fileMin);\n  const fileMax = userVar(args, 'v8_max_ratio', DEFAULTS.fileMax);\n  const fileBytes = num(user.src_bytes); const vBytes = num(user.src_video_bytes) || fileBytes * 0.85;\n  const other = fileBytes ? Math.max(0, Math.min(0.9, (fileBytes - vBytes) / fileBytes)) : 0.15;   // share of file that isn't video\n  const toVideo = (f) => (f - other) / (1 - other);\n  const toFile = (r) => other + (1 - other) * r;\n  const cfg = {\n    ...DEFAULTS,\n    targetRatio: Math.max(0.15, toVideo(fileTarget)),\n    minRatio: Math.max(0.10, toVideo(fileMin)),\n    ssimFloor: userVar(args, 'v8_ssim_floor', DEFAULTS.ssimFloor),\n  };\n  const vKbps = num(user.src_kbps);\n  const height = num(user.src_height) || 1080;\n  const duration = num(user.src_duration);\n\n  const info = JSON.parse((await run(ffprobe, ['-v', 'error', '-print_format', 'json', '-show_streams', '-select_streams', 'v:0', file])).stdout);\n  const v = (info.streams || [])[0] || {};\n  const x265Params = encoder === 'libx265' ? hdrParams(v, await firstFrameSideData(ffprobe, file)) : [];\n  if (encoder === 'libx265' && vKbps) x265Params.push(`vbv-maxrate=${Math.round(vKbps)}`, `vbv-bufsize=${Math.round(vKbps * 2)}`);   // never above source bitrate\n  const filter = user.conform_filter || '';\n  const genpts = user.conform_genpts === 'true' ? ['-fflags', '+genpts'] : [];\n\n  const ref = enc.ref28Kbps * Math.pow((height / 1080) ** 2, 0.75);\n  const guess = vKbps ? 28 + 6 * Math.log2(ref / (vKbps * cfg.targetRatio)) : (enc.lo + enc.hi) / 2;\n  const clampQ = (q) => Math.max(enc.lo, Math.min(enc.hi, Math.round(q)));\n  log(`${enc.label} search: whole file target ${(fileTarget * 100).toFixed(0)}% (min ${(fileMin * 100).toFixed(0)}%, skip above ${(fileMax * 100).toFixed(0)}%) = video ${(cfg.targetRatio * 100).toFixed(0)}% (min ${(cfg.minRatio * 100).toFixed(0)}%; ${(other * 100).toFixed(0)}% of the file is audio/subs), SSIM floor ${cfg.ssimFloor}, first guess ${clampQ(guess)}${filter ? `, filters ${filter}` : ''}`);\n\n  // ── samples ───────────────────────────────────────────────────────────────\n  const work = path.join(args.workDir, 'quality-report');\n  fs.mkdirSync(work, { recursive: true });\n  const n = duration < 180 ? 1 : 3;\n  const len = Math.min(duration < 180 ? duration * 0.5 : (height > 1600 ? 6 : 8), 30);\n  const src = [];\n  for (let i = 0; i < n; i += 1) {\n    const at = n === 1 ? duration * 0.1 : duration * (0.15 + (0.7 * i) / (n - 1));\n    const out = path.join(work, `src${i}.mkv`);\n    await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', ...genpts, '-ss', at.toFixed(2), '-i', file, '-t', len.toFixed(2),\n      '-map', '0:v:0', '-c', 'copy', '-an', '-sn', out]);\n    src.push(out);\n  }\n  const srcBytes = src.reduce((a, f) => a + fs.statSync(f).size, 0);\n\n  // ── search ────────────────────────────────────────────────────────────────\n  const tried = [];\n  const measure = async (q) => {\n    const t0 = Date.now(); let bytes = 0; const ss = [];\n    for (let i = 0; i < src.length; i += 1) {\n      const out = path.join(work, `enc${i}_q${q}.mkv`);\n      await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', src[i], '-map', '0:v:0', ...(filter ? ['-vf', filter] : []),\n        ...videoArgs(encoder, q, x265Params, vKbps), '-an', '-sn', out]);\n      bytes += fs.statSync(out).size;\n      const refChain = `${filter ? `${filter},` : ''}format=yuv420p10le`;\n      const { stderr } = await run(ffmpeg, ['-hide_banner', '-nostats', '-i', out, '-i', src[i], '-lavfi',\n        `[0:v]format=yuv420p10le[a];[1:v]${refChain}[b];[a][b]ssim`, '-f', 'null', '-']);\n      const m = stderr.match(/SSIM Y:([0-9.]+)/);\n      if (m) ss.push(parseFloat(m[1]));\n    }\n    const r = { q, ratio: bytes / srcBytes, ssim: ss.length ? ss.reduce((a, b) => a + b, 0) / ss.length : null };\n    tried.push(r);\n    log(`round ${tried.length}: ${enc.label} ${q} -> video ${(r.ratio * 100).toFixed(1)}% of source, SSIM ${r.ssim === null ? 'n/a' : r.ssim.toFixed(4)} (${((Date.now() - t0) / 1000).toFixed(0)} s)`);\n    return r;\n  };\n  // ── search: bracket the target, then interpolate on the measured size curve ───────────────\n  // Size curves differ a lot (lean WEB ~6 CRF per halving; grainy Blu-ray can be ~2-3), so after the\n  // first measurement the next guess comes from measured points. A result pinned at the VBV cap (>95%)\n  // only says \"too big\". A CRF that fails the SSIM floor caps every later guess below it.\n  const capped = (t) => t.ratio > 0.95;\n  const qualityOk = (t) => t.ssim === null || t.ssim >= cfg.ssimFloor;\n  const onTarget = (t) => Math.abs(toFile(t.ratio) - fileTarget) <= 0.05 && t.ratio >= cfg.minRatio;\n  const bracket = () => ({\n    big: tried.filter((t) => t.ratio > cfg.targetRatio).sort((a, b) => b.q - a.q)[0],     // highest q still too big\n    small: tried.filter((t) => t.ratio <= cfg.targetRatio).sort((a, b) => a.q - b.q)[0],  // lowest q already small enough\n  });\n  const between = (big, small, r) => big.q + (small.q - big.q) * Math.log(big.ratio / r) / Math.log(big.ratio / small.ratio);\n  const slope = () => {   // quality steps per halving of size: bracket if we have one, else uncapped points, else 6\n    const { big, small } = bracket();\n    if (big && small && !capped(big) && small.q > big.q) return Math.max(1.5, Math.min(12, (small.q - big.q) / Math.log2(big.ratio / small.ratio)));\n    const u = tried.filter((t) => !capped(t));\n    if (u.length < 2) return 6;\n    const [a, b] = u.slice(-2); const d = Math.log2(a.ratio / b.ratio);\n    return Math.abs(d) > 0.05 ? Math.max(1.5, Math.min(12, (b.q - a.q) / d)) : 6;\n  };\n\n  let qCeil = enc.hi;\n  let cur = await measure(clampQ(guess));\n  for (;;) {\n    if (!qualityOk(cur)) qCeil = Math.min(qCeil, cur.q - 1);\n    if (qualityOk(cur) && onTarget(cur)) break;\n    if (tried.length >= cfg.maxRounds) break;\n    const { big, small } = bracket();\n    let next;\n    if (big && small) next = between(big, small, cfg.targetRatio);\n    else if (big) next = big.q + Math.max(capped(big) ? 4 : 1, slope() * Math.log2(big.ratio / cfg.targetRatio));\n    else next = small.q - Math.max(1, slope() * Math.log2(cfg.targetRatio / small.ratio));\n    next = clampQ(next);\n    if (big && small) next = Math.max(big.q + 1, Math.min(small.q - 1, next));   // stay inside the bracket\n    next = Math.min(next, qCeil);\n    if (next < enc.lo) break;                     // quality floor can't be met inside the allowed range\n    next = clampQ(next);\n    if (tried.some((t) => t.q === next)) break;   // bracket closed: nothing new to learn\n    cur = await measure(next);\n  }\n  fs.rmSync(work, { recursive: true, force: true });\n\n  // choose: closest to target among measured points that pass quality and the minimum\n  const valid = tried.filter((t) => qualityOk(t) && t.ratio >= cfg.minRatio);\n  let best = valid.length ? valid.reduce((a, b) => (Math.abs(toFile(b.ratio) - fileTarget) < Math.abs(toFile(a.ratio) - fileTarget) ? b : a)) : null;\n  let estimated = false;\n  const { big, small } = bracket();\n  // not converged but the target is bracketed: use the interpolated value; Verify measures the real\n  // result and can retry once, which is far better than skipping or taking a distant point\n  if ((!best || !onTarget(best)) && big && small && small.q - big.q > 1) {\n    const q = Math.min(qCeil, Math.max(big.q + 1, Math.min(small.q - 1, Math.round(between(big, small, cfg.targetRatio)))));\n    const t = (q - big.q) / (small.q - big.q);\n    best = { q, ratio: Math.exp(Math.log(big.ratio) + t * (Math.log(small.ratio) - Math.log(big.ratio))), ssim: small.ssim };\n    estimated = true;\n  }\n  if (!best) {\n    const lowest = tried.reduce((a, b) => (b.q < a.q ? b : a));\n    if (lowest.ratio < cfg.minRatio && lowest.q <= enc.lo + 1) return skip(`even ${enc.label} ${enc.lo} shrinks the file to ~${(toFile(lowest.ratio) * 100).toFixed(0)}% (rule: never below ${(fileMin * 100).toFixed(0)}%)`);\n    return skip(`no ${enc.label} value met the SSIM floor ${cfg.ssimFloor} at a useful size`);\n  }\n  const predicted = Math.min(1, toFile(best.ratio));\n  if (predicted > fileMax) return skip(`best quality-safe ${enc.label} ${best.q} only gets the file to ~${(predicted * 100).toFixed(0)}% (skip above ${(fileMax * 100).toFixed(0)}%)`);\n  if (estimated) log(`not converged in ${tried.length} rounds; target bracketed by ${enc.label} ${big.q} (${(big.ratio * 100).toFixed(0)}%) and ${small.q} (${(small.ratio * 100).toFixed(0)}%) -> interpolated ${best.q}; Verify will confirm`);\n  Object.assign(user, {\n    encode_quality: String(best.q), encode_attempt: '1', x265_params: x265Params.join(':'),\n    report_target: cfg.targetRatio.toFixed(3), report_min: cfg.minRatio.toFixed(3), report_slope: slope().toFixed(2),\n    report_file_target: fileTarget.toFixed(3), report_file_min: fileMin.toFixed(3),\n    report_q_lo: String(enc.lo), report_q_hi: String(enc.hi),\n    report_video_ratio: best.ratio.toFixed(3), report_file_ratio: predicted.toFixed(3),\n    report_ssim: best.ssim === null ? '' : best.ssim.toFixed(4), report_decision: 'encode',\n  });\n  log(`DECISION: ${enc.label} ${best.q}${estimated ? ' (interpolated)' : ''} | video ~${(best.ratio * 100).toFixed(0)}% | whole file ~${(predicted * 100).toFixed(0)}% | SSIM ${user.report_ssim || 'n/a'}${estimated ? ' (nearest measured)' : ''}`);\n  return { outputFileObj: args.inputFileObj, outputNumber: 1, variables: args.variables };\n};\n"
+    },
+    "fpEnabled": true,
+    "id": "F1_REPORT",
+    "position": {
+     "x": 760,
+     "y": 910
+    }
+   },
+   {
+    "name": "→ Go To Flow 2: Encode",
+    "sourceRepo": "Community",
+    "pluginName": "goToFlow",
+    "version": "2.0.0",
+    "inputsDB": {
+     "flowId": "adaptive_hevc_2_encode",
+     "pluginId": "F2_INPUT"
+    },
+    "fpEnabled": true,
+    "id": "F1_GOTO_ENCODE",
+    "position": {
+     "x": 600,
+     "y": 1040
+    }
+   },
+   {
+    "name": "Skip: Not Worth Encoding",
+    "sourceRepo": "Community",
+    "pluginName": "setOriginalFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F1_SKIP_REPORT",
+    "position": {
+     "x": 1000,
+     "y": 1040
+    }
+   },
+   {
+    "name": "On Flow Error",
+    "sourceRepo": "Community",
+    "pluginName": "onFlowError",
+    "version": "1.0.0",
+    "inputsDB": null,
+    "fpEnabled": true,
+    "id": "F1_ERROR_HANDLER",
+    "position": {
+     "x": 1200,
+     "y": 0
+    }
+   },
+   {
+    "name": "Hard Fail",
+    "sourceRepo": "Community",
+    "pluginName": "failFlow",
+    "version": "1.0.0",
+    "inputsDB": null,
+    "fpEnabled": true,
+    "id": "F1_HARD_FAIL",
+    "position": {
+     "x": 1200,
+     "y": 120
+    }
+   }
+  ],
+  "flowEdges": [
+   {
+    "id": "e1",
+    "source": "F1_INPUT",
+    "sourceHandle": "1",
+    "target": "F1_CHECK_HEVC",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e2",
+    "source": "F1_CHECK_HEVC",
+    "sourceHandle": "1",
+    "target": "F1_SKIP_HEVC",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e3",
+    "source": "F1_CHECK_HEVC",
+    "sourceHandle": "2",
+    "target": "F1_CHECK_AV1",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4",
+    "source": "F1_CHECK_AV1",
+    "sourceHandle": "1",
+    "target": "F1_SKIP_AV1",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e5",
+    "source": "F1_CHECK_AV1",
+    "sourceHandle": "2",
+    "target": "F1_PROFILE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e6",
+    "source": "F1_PROFILE",
+    "sourceHandle": "1",
+    "target": "F1_WANT_GPU",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e7",
+    "source": "F1_PROFILE",
+    "sourceHandle": "2",
+    "target": "F1_SKIP_PROFILE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e8",
+    "source": "F1_WANT_GPU",
+    "sourceHandle": "1",
+    "target": "F1_CHECK_NVENC",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e9",
+    "source": "F1_WANT_GPU",
+    "sourceHandle": "2",
+    "target": "F1_SET_CPU",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e10",
+    "source": "F1_CHECK_NVENC",
+    "sourceHandle": "1",
+    "target": "F1_SET_GPU",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e11",
+    "source": "F1_CHECK_NVENC",
+    "sourceHandle": "2",
+    "target": "F1_SET_CPU",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e12",
+    "source": "F1_SET_GPU",
+    "sourceHandle": "1",
+    "target": "F1_REPORT",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e13",
+    "source": "F1_SET_CPU",
+    "sourceHandle": "1",
+    "target": "F1_REPORT",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e14",
+    "source": "F1_REPORT",
+    "sourceHandle": "1",
+    "target": "F1_GOTO_ENCODE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e15",
+    "source": "F1_REPORT",
+    "sourceHandle": "2",
+    "target": "F1_SKIP_REPORT",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e16",
+    "source": "F1_ERROR_HANDLER",
+    "sourceHandle": "1",
+    "target": "F1_HARD_FAIL",
+    "animated": true,
+    "type": "smoothstep"
+   }
+  ]
+ },
+ {
+  "_id": "adaptive_hevc_2_encode",
+  "name": "Adaptive HEVC - 2 Encode",
+  "priority": 11,
+  "isUiLocked": false,
+  "flowPlugins": [
+   {
+    "name": "Input File",
+    "sourceRepo": "Community",
+    "pluginName": "inputFile",
+    "version": "1.0.0",
+    "inputsDB": {
+     "fileAccessChecks": "false",
+     "pauseNodeIfAccessChecksFail": "false"
+    },
+    "fpEnabled": true,
+    "id": "F2_INPUT",
+    "position": {
+     "x": 760,
+     "y": 0
+    }
+   },
+   {
+    "name": "Begin FFmpeg Command",
+    "sourceRepo": "Community",
+    "pluginName": "ffmpegCommandStart",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F2_START",
+    "position": {
+     "x": 760,
+     "y": 150
+    }
+   },
+   {
+    "name": "Build Encode (x265 CRF + conform streams + MKV)",
+    "sourceRepo": "Community",
+    "pluginName": "customFunction",
+    "version": "1.0.0",
+    "inputsDB": {
+     "code": "// Adaptive HEVC — build the single encode command (flow 2, after \"Begin FFmpeg Command\").\n// Everything v7's separate Conform pass did, plus the conform needs found by Source Profile, in one encode:\n//   video: libx265 CRF (CPU) or hevc_nvenc CQ (GPU) at the Quality Report's value, 10-bit, same\n//          arguments as the report's samples; deinterlace / even-crop filter when needed\n//   input: regenerate timestamps for AVI / MPEG-PS / TS sources\n//   audio: copy, except PCM variants MKV can't hold -> FLAC\n//   subtitles: mov_text/webvtt/text -> SRT, image + SRT/ASS copied, unsupported dropped\n//   data streams and cover art dropped, fonts kept | order video, audio, subtitle, attachment | MKV\nmodule.exports = async (args) => {\n  const cmd = args.variables.ffmpegCommand;\n  const user = args.variables.user || {};\n  const log = (m) => args.jobLog(`[build encode] ${m}`);\n  const q = user.encode_quality;\n  if (!q) throw new Error('encode_quality is not set - the Quality Report (flow 1) did not run');\n  const nvenc = user.encoder === 'hevc_nvenc';\n  const vKbps = parseFloat(user.src_kbps) || 0;\n\n  const toSrt = ['mov_text', 'webvtt', 'text', 'tx3g'];\n  const copySubs = ['subrip', 'srt', 'ass', 'ssa', 'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'];\n  const flacAudio = String(user.conform_audio_flac || '').split(',').filter(Boolean).map(Number);\n  const rank = { video: 0, audio: 1, subtitle: 2, attachment: 3 };\n  let videoSet = false;\n  const notes = [];\n\n  for (const s of cmd.streams) {\n    const type = s.codec_type;\n    const coverArt = s.disposition && Number(s.disposition.attached_pic) === 1;\n    if (type === 'video' && !coverArt && !videoSet) {\n      videoSet = true;\n      if (user.conform_filter) s.outputArgs.push('-filter:{outputIndex}', user.conform_filter);\n      if (nvenc) {\n        s.outputArgs.push('-c:{outputIndex}', 'hevc_nvenc', '-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-cq', q, '-b:v', '0',\n          '-profile:{outputIndex}', 'main10', '-pix_fmt:{outputIndex}', 'p010le');\n        if (vKbps) s.outputArgs.push('-maxrate', `${Math.round(vKbps)}k`, '-bufsize', `${Math.round(vKbps * 2)}k`);\n      } else {\n        s.outputArgs.push('-c:{outputIndex}', 'libx265', '-crf', q, '-preset', 'slow',\n          '-profile:{outputIndex}', 'main10', '-pix_fmt:{outputIndex}', 'yuv420p10le');\n        if (user.x265_params) s.outputArgs.push('-x265-params', user.x265_params);\n      }\n    } else if (coverArt || type === 'data') {\n      s.removed = true; notes.push(`drop #${s.index} ${coverArt ? 'cover art' : 'data'} (${s.codec_name || '?'})`);\n    } else if (type === 'audio' && flacAudio.includes(s.index)) {\n      s.outputArgs.push('-c:{outputIndex}', 'flac'); notes.push(`audio #${s.index} ${s.codec_name} -> flac`);\n    } else if (type === 'subtitle') {\n      if (toSrt.includes(s.codec_name)) { s.outputArgs.push('-c:{outputIndex}', 'srt'); notes.push(`sub #${s.index} ${s.codec_name} -> srt`); }\n      else if (!copySubs.includes(s.codec_name)) { s.removed = true; notes.push(`drop #${s.index} subtitle ${s.codec_name || 'unknown'} (not muxable to MKV)`); }\n    }\n  }\n  if (!videoSet) throw new Error('no video stream to encode');\n\n  if (user.conform_genpts === 'true') cmd.overallInputArguments.push('-fflags', '+genpts');\n  cmd.streams.sort((a, b) => (rank[a.codec_type] ?? 9) - (rank[b.codec_type] ?? 9));\n  cmd.container = 'mkv';\n  cmd.shouldProcess = true;\n  cmd.overallOuputArguments.push('-max_muxing_queue_size', '9999');\n  log(`attempt ${user.encode_attempt || 1}: ${nvenc ? `NVENC CQ ${q}` : `x265 CRF ${q} slow`}, 10-bit${user.conform_filter ? `, filter ${user.conform_filter}` : ''}${user.conform_genpts === 'true' ? ', regenerate timestamps' : ''}`);\n  if (notes.length) log(notes.join('; '));\n  return { outputFileObj: args.inputFileObj, outputNumber: 1, variables: args.variables };\n};\n"
+    },
+    "fpEnabled": true,
+    "id": "F2_BUILD",
+    "position": {
+     "x": 760,
+     "y": 300
+    }
+   },
+   {
+    "name": "Execute Encode (single pass)",
+    "sourceRepo": "Community",
+    "pluginName": "ffmpegCommandExecute",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F2_EXECUTE",
+    "position": {
+     "x": 760,
+     "y": 450
+    }
+   },
+   {
+    "name": "→ Go To Flow 3: Verify",
+    "sourceRepo": "Community",
+    "pluginName": "goToFlow",
+    "version": "2.0.0",
+    "inputsDB": {
+     "flowId": "adaptive_hevc_3_verify",
+     "pluginId": "F3_INPUT"
+    },
+    "fpEnabled": true,
+    "id": "F2_GOTO_VERIFY",
+    "position": {
+     "x": 760,
+     "y": 600
+    }
+   },
+   {
+    "name": "On Flow Error",
+    "sourceRepo": "Community",
+    "pluginName": "onFlowError",
+    "version": "1.0.0",
+    "inputsDB": null,
+    "fpEnabled": true,
+    "id": "F2_ERROR_HANDLER",
+    "position": {
+     "x": 1200,
+     "y": 0
+    }
+   },
+   {
+    "name": "Hard Fail",
+    "sourceRepo": "Community",
+    "pluginName": "failFlow",
+    "version": "1.0.0",
+    "inputsDB": null,
+    "fpEnabled": true,
+    "id": "F2_HARD_FAIL",
+    "position": {
+     "x": 1200,
+     "y": 120
+    }
+   }
+  ],
+  "flowEdges": [
+   {
+    "id": "e1",
+    "source": "F2_INPUT",
+    "sourceHandle": "1",
+    "target": "F2_START",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e2",
+    "source": "F2_START",
+    "sourceHandle": "1",
+    "target": "F2_BUILD",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e3",
+    "source": "F2_BUILD",
+    "sourceHandle": "1",
+    "target": "F2_EXECUTE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4",
+    "source": "F2_EXECUTE",
+    "sourceHandle": "1",
+    "target": "F2_GOTO_VERIFY",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e5",
+    "source": "F2_ERROR_HANDLER",
+    "sourceHandle": "1",
+    "target": "F2_HARD_FAIL",
+    "animated": true,
+    "type": "smoothstep"
+   }
+  ]
+ },
+ {
+  "_id": "adaptive_hevc_3_verify",
+  "name": "Adaptive HEVC - 3 Verify",
+  "priority": 12,
+  "isUiLocked": false,
+  "flowPlugins": [
+   {
+    "name": "Input File",
+    "sourceRepo": "Community",
+    "pluginName": "inputFile",
+    "version": "1.0.0",
+    "inputsDB": {
+     "fileAccessChecks": "false",
+     "pauseNodeIfAccessChecksFail": "false"
+    },
+    "fpEnabled": true,
+    "id": "F3_INPUT",
+    "position": {
+     "x": 760,
+     "y": 0
+    }
+   },
+   {
+    "name": "Verify (HEVC, duration, audio, size) -> ok / keep original / retry",
+    "sourceRepo": "Community",
+    "pluginName": "customFunction",
+    "version": "1.0.0",
+    "inputsDB": {
+     "code": "// Adaptive HEVC — verify the encode before anything replaces the original (flow 3).\n// Output 1 = good -> replace + notify\n// Output 2 = keep original (broken encode, or still out of range after the allowed retries)\n// Output 3 = retry: re-encode once more with a corrected quality value (counter: encode_attempt,\n//            limit: v8_max_retries, default 1). The correction uses the REAL full-file result, so a\n//            single retry is normally enough.\nconst { execFile } = require('child_process');\nconst fs = require('fs');\n\n// Whole-file window (target 50%, never below 40%): retry outside 37-70%; after the retries a file\n// between 70% and 85% is still accepted (it saved space), anything else keeps the original.\nconst RETRY_ABOVE = 0.70;      // further from the 50% target than the samples should ever miss by\nconst ACCEPT_UP_TO = 0.85;     // after retries: still worth replacing if it saves 15%+\nconst GRACE = 0.03;            // sample-based estimates: allow 37% before calling it \"below 40%\"\nconst BROKEN_BELOW = 0.10;     // smaller than this is a broken encode, not \"too good\"\n\nfunction probe(ffprobe, file) {\n  return new Promise((resolve, reject) => execFile(ffprobe, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file],\n    { maxBuffer: 32 * 1024 * 1024 }, (e, out) => (e ? reject(e) : resolve(JSON.parse(String(out))))));\n}\nfunction userVar(args, name, dflt) {\n  const lib = (args.userVariables && args.userVariables.library) || {};\n  const glob = (args.userVariables && args.userVariables.global) || {};\n  const n = parseFloat(lib[name] !== undefined && lib[name] !== '' ? lib[name] : glob[name]);\n  return Number.isFinite(n) ? n : dflt;\n}\n\nmodule.exports = async (args) => {\n  const user = args.variables.user || {};\n  const log = (m) => args.jobLog(`[verify] ${m}`);\n  const ffprobe = args.ffProbePath || 'tdarr-ffprobe';\n  const result = (n) => ({ outputFileObj: args.inputFileObj, outputNumber: n, variables: args.variables });\n  const keep = (why) => { log(`KEEP ORIGINAL - ${why}`); return result(2); };\n\n  const out = args.inputFileObj._id;\n  const outBytes = fs.statSync(out).size;\n  const srcBytes = parseFloat(user.src_bytes) || 0;\n  const srcVideo = parseFloat(user.src_video_bytes) || srcBytes * 0.85;\n  const info = await probe(ffprobe, out);\n  const v = (info.streams || []).find((s) => s.codec_type === 'video');\n  const audio = (info.streams || []).filter((s) => s.codec_type === 'audio').length;\n  const dur = parseFloat(info.format.duration) || 0;\n  const srcDur = parseFloat(user.src_duration) || 0;\n\n  // integrity: never retried, the problem isn't the quality value\n  if (!v || v.codec_name !== 'hevc') return keep(`output video is ${v ? v.codec_name : 'missing'}, expected hevc`);\n  if (srcDur && Math.abs(dur - srcDur) > Math.max(2, srcDur * 0.005)) return keep(`duration ${dur.toFixed(1)} s vs source ${srcDur.toFixed(1)} s (truncated encode?)`);\n  if (user.src_audio_count && audio !== parseInt(user.src_audio_count, 10)) return keep(`${audio} audio tracks vs ${user.src_audio_count} in source`);\n  if (!srcBytes) return keep('source size unknown');\n\n  const fileRatio = outBytes / srcBytes;\n  const videoRatio = Math.max(0.001, (outBytes - (srcBytes - srcVideo)) / srcVideo);   // audio/subs are copied\n  const target = parseFloat(user.report_target) || 0.5;   // video-stream target (for the correction maths)\n  const fileMin = parseFloat(user.report_file_min) || 0.40;\n  const attempt = parseInt(user.encode_attempt || '1', 10);\n  const maxRetries = userVar(args, 'v8_max_retries', 1);\n  const q = parseInt(user.encode_quality, 10);\n  log(`attempt ${attempt}: file ${(fileRatio * 100).toFixed(1)}% of original (report predicted ~${(parseFloat(user.report_file_ratio || 0) * 100).toFixed(0)}%, target ${(parseFloat(user.report_file_target || 0.5) * 100).toFixed(0)}%, min ${(fileMin * 100).toFixed(0)}%) at ${user.encoder === 'hevc_nvenc' ? 'CQ' : 'CRF'} ${q}`);\n\n  if (fileRatio < BROKEN_BELOW) return keep(`output is suspiciously small (${(fileRatio * 100).toFixed(1)}%)`);\n  const tooFar = fileRatio < fileMin - GRACE;\n  const tooBig = fileRatio > RETRY_ABOVE;\n  if (!tooBig && !tooFar) { user.result_file_ratio = fileRatio.toFixed(3); log('OK'); return result(1); }\n\n  const why = tooBig ? `file is ${(fileRatio * 100).toFixed(1)}%, well above the 50% target` : `shrank too far (${(fileRatio * 100).toFixed(1)}% < ${(fileMin * 100).toFixed(0)}% minimum)`;\n  if (attempt > maxRetries) {\n    if (tooBig && fileRatio <= ACCEPT_UP_TO) { user.result_file_ratio = fileRatio.toFixed(3); log(`ACCEPT - ${why}, but retries are used up and it still saves ${((1 - fileRatio) * 100).toFixed(0)}%`); return result(1); }\n    return keep(`${why}; ${attempt - 1} retr${attempt - 1 === 1 ? 'y' : 'ies'} used (limit ${maxRetries})`);\n  }\n\n  // corrected quality from the real result: ~slope steps per halving of size\n  const slope = parseFloat(user.report_slope) || 6;\n  const lo = parseInt(user.report_q_lo || '16', 10); const hi = parseInt(user.report_q_hi || '34', 10);\n  let next = Math.round(q + slope * Math.log2(videoRatio / target));\n  if (next === q) next = tooBig ? q + 1 : q - 1;\n  next = Math.max(lo, Math.min(hi, next));\n  if (next === q) return keep(`${why}; quality value already at its limit (${q})`);\n  user.encode_quality = String(next);\n  user.encode_attempt = String(attempt + 1);\n  log(`RETRY ${attempt}/${maxRetries} - ${why}; ${q} -> ${next}`);\n  return result(3);\n};\n"
+    },
+    "fpEnabled": true,
+    "id": "F3_VERIFY",
+    "position": {
+     "x": 760,
+     "y": 150
+    }
+   },
+   {
+    "name": "→ Go To Flow 4: Replace + Notify",
+    "sourceRepo": "Community",
+    "pluginName": "goToFlow",
+    "version": "2.0.0",
+    "inputsDB": {
+     "flowId": "adaptive_hevc_4_notify",
+     "pluginId": "F4_INPUT"
+    },
+    "fpEnabled": true,
+    "id": "F3_GOTO_NOTIFY",
+    "position": {
+     "x": 600,
+     "y": 320
+    }
+   },
+   {
+    "name": "Keep Original: Delete Encode",
+    "sourceRepo": "Community",
+    "pluginName": "deleteFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F3_DELETE",
+    "position": {
+     "x": 920,
+     "y": 320
+    }
+   },
+   {
+    "name": "Keep Original: Restore",
+    "sourceRepo": "Community",
+    "pluginName": "setOriginalFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F3_RESTORE",
+    "position": {
+     "x": 920,
+     "y": 470
+    }
+   },
+   {
+    "name": "Retry: Delete Encode",
+    "sourceRepo": "Community",
+    "pluginName": "deleteFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F3_RETRY_DELETE",
+    "position": {
+     "x": 1240,
+     "y": 320
+    }
+   },
+   {
+    "name": "Retry: Restore Original",
+    "sourceRepo": "Community",
+    "pluginName": "setOriginalFile",
+    "version": "1.0.0",
+    "inputsDB": {},
+    "fpEnabled": true,
+    "id": "F3_RETRY_RESTORE",
+    "position": {
+     "x": 1240,
+     "y": 470
+    }
+   },
+   {
+    "name": "Retry: → Re-Encode (Flow 2)",
+    "sourceRepo": "Community",
+    "pluginName": "goToFlow",
+    "version": "2.0.0",
+    "inputsDB": {
+     "flowId": "adaptive_hevc_2_encode",
+     "pluginId": "F2_INPUT"
+    },
+    "fpEnabled": true,
+    "id": "F3_RETRY_GOTO",
+    "position": {
+     "x": 1240,
+     "y": 620
+    }
+   },
+   {
+    "name": "On Flow Error",
+    "sourceRepo": "Community",
+    "pluginName": "onFlowError",
+    "version": "1.0.0",
+    "inputsDB": null,
+    "fpEnabled": true,
+    "id": "F3_ERROR_HANDLER",
+    "position": {
+     "x": 1200,
+     "y": 0
+    }
+   },
+   {
+    "name": "Hard Fail",
+    "sourceRepo": "Community",
+    "pluginName": "failFlow",
+    "version": "1.0.0",
+    "inputsDB": null,
+    "fpEnabled": true,
+    "id": "F3_HARD_FAIL",
+    "position": {
+     "x": 1200,
+     "y": 120
+    }
+   }
+  ],
+  "flowEdges": [
+   {
+    "id": "e1",
+    "source": "F3_INPUT",
+    "sourceHandle": "1",
+    "target": "F3_VERIFY",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e2",
+    "source": "F3_VERIFY",
+    "sourceHandle": "1",
+    "target": "F3_GOTO_NOTIFY",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e3",
+    "source": "F3_VERIFY",
+    "sourceHandle": "2",
+    "target": "F3_DELETE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4",
+    "source": "F3_VERIFY",
+    "sourceHandle": "3",
+    "target": "F3_RETRY_DELETE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e5",
+    "source": "F3_DELETE",
+    "sourceHandle": "1",
+    "target": "F3_RESTORE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e6",
+    "source": "F3_RETRY_DELETE",
+    "sourceHandle": "1",
+    "target": "F3_RETRY_RESTORE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e7",
+    "source": "F3_RETRY_RESTORE",
+    "sourceHandle": "1",
+    "target": "F3_RETRY_GOTO",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e8",
+    "source": "F3_ERROR_HANDLER",
+    "sourceHandle": "1",
+    "target": "F3_HARD_FAIL",
+    "animated": true,
+    "type": "smoothstep"
+   }
+  ]
+ },
+ {
+  "_id": "adaptive_hevc_4_notify",
+  "name": "Adaptive HEVC - 4 Notify",
+  "priority": 13,
+  "flowPlugins": [
+   {
+    "name": "Input File",
+    "sourceRepo": "Community",
+    "pluginName": "inputFile",
+    "version": "1.0.0",
+    "inputsDB": {
+     "fileAccessChecks": "false",
+     "pauseNodeIfAccessChecksFail": "false"
+    },
+    "fpEnabled": true,
+    "id": "F4_INPUT",
+    "position": {
+     "x": 760,
+     "y": -1800
+    }
+   },
+   {
+    "name": "Replace Original File",
+    "sourceRepo": "Community",
+    "pluginName": "replaceOriginalFile",
+    "version": "1.0.0",
+    "fpEnabled": true,
+    "id": "F4_REPLACE",
+    "position": {
+     "x": 760,
+     "y": -1700
+    }
+   },
+   {
+    "name": "Is TV Shows Library?",
+    "sourceRepo": "Community",
+    "pluginName": "checkFlowVariable",
+    "version": "1.0.0",
+    "inputsDB": {
+     "variable": "{{{args.userVariables.library.library_name}}}",
+     "condition": "==",
+     "value": "TV Shows"
+    },
+    "fpEnabled": true,
+    "id": "F4_CHECK_LIBRARY",
+    "position": {
+     "x": 760,
+     "y": -1600
+    }
+   },
+   {
+    "name": "Notify Sonarr",
+    "sourceRepo": "Community",
+    "pluginName": "notifyRadarrOrSonarr",
+    "version": "2.0.0",
+    "inputsDB": {
+     "arr": "sonarr",
+     "arr_host": "{{{args.userVariables.library.sonarr_url}}}",
+     "arr_api_key": "{{{args.userVariables.library.sonarr_api_key}}}"
+    },
+    "fpEnabled": true,
+    "id": "F4_NOTIFY_SONARR",
+    "position": {
+     "x": 460,
+     "y": -1500
+    }
+   },
+   {
+    "name": "Refresh Plex TV Library",
+    "sourceRepo": "Community",
+    "pluginName": "runClassicTranscodePlugin",
+    "version": "2.0.0",
+    "inputsDB": {
+     "pluginSourceId": "Community:Tdarr_Plugin_goof1_URL_Plex_Refresh",
+     "Plex_Url": "{{{args.userVariables.library.plex_url}}}",
+     "Plex_Token": "{{{args.userVariables.library.plex_token}}}"
+    },
+    "fpEnabled": true,
+    "id": "F4_PLEX_TV",
+    "position": {
+     "x": 460,
+     "y": -1400
+    }
+   },
+   {
+    "name": "Notify Radarr",
+    "sourceRepo": "Community",
+    "pluginName": "notifyRadarrOrSonarr",
+    "version": "2.0.0",
+    "inputsDB": {
+     "arr": "radarr",
+     "arr_host": "{{{args.userVariables.library.radarr_url}}}",
+     "arr_api_key": "{{{args.userVariables.library.radarr_api_key}}}"
+    },
+    "fpEnabled": true,
+    "id": "F4_NOTIFY_RADARR",
+    "position": {
+     "x": 1060,
+     "y": -1500
+    }
+   },
+   {
+    "name": "Refresh Plex Movie Library",
+    "sourceRepo": "Community",
+    "pluginName": "runClassicTranscodePlugin",
+    "version": "2.0.0",
+    "inputsDB": {
+     "pluginSourceId": "Community:Tdarr_Plugin_goof1_URL_Plex_Refresh",
+     "Plex_Url": "{{{args.userVariables.library.plex_url}}}",
+     "Plex_Token": "{{{args.userVariables.library.plex_token}}}",
+     "Library_Key": "{{{args.userVariables.library.plex_library}}}"
+    },
+    "fpEnabled": true,
+    "id": "F4_PLEX_MOVIE",
+    "position": {
+     "x": 1060,
+     "y": -1400
+    }
+   },
+   {
+    "name": "Reset Flow Error",
+    "sourceRepo": "Community",
+    "pluginName": "resetFlowError",
+    "version": "1.0.0",
+    "fpEnabled": true,
+    "id": "F4_RESET_ERROR",
+    "position": {
+     "x": 760,
+     "y": -1300
+    }
+   },
+   {
+    "name": "On Flow Error",
+    "sourceRepo": "Community",
+    "pluginName": "onFlowError",
+    "version": "1.0.0",
+    "fpEnabled": true,
+    "id": "F4_ERROR_HANDLER",
+    "position": {
+     "x": 1200,
+     "y": -1800
+    }
+   },
+   {
+    "name": "Hard Fail",
+    "sourceRepo": "Community",
+    "pluginName": "failFlow",
+    "version": "1.0.0",
+    "fpEnabled": true,
+    "id": "F4_HARD_FAIL",
+    "position": {
+     "x": 1200,
+     "y": -1700
+    }
+   }
+  ],
+  "flowEdges": [
+   {
+    "id": "e4_1",
+    "source": "F4_INPUT",
+    "sourceHandle": "1",
+    "target": "F4_REPLACE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_2",
+    "source": "F4_REPLACE",
+    "sourceHandle": "1",
+    "target": "F4_CHECK_LIBRARY",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_3",
+    "source": "F4_CHECK_LIBRARY",
+    "sourceHandle": "1",
+    "target": "F4_NOTIFY_SONARR",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_4",
+    "source": "F4_CHECK_LIBRARY",
+    "sourceHandle": "2",
+    "target": "F4_NOTIFY_RADARR",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_5",
+    "source": "F4_NOTIFY_SONARR",
+    "sourceHandle": "1",
+    "target": "F4_PLEX_TV",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_6",
+    "source": "F4_NOTIFY_SONARR",
+    "sourceHandle": "2",
+    "target": "F4_PLEX_TV",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_7",
+    "source": "F4_PLEX_TV",
+    "sourceHandle": "1",
+    "target": "F4_RESET_ERROR",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_8",
+    "source": "F4_PLEX_TV",
+    "sourceHandle": "2",
+    "target": "F4_RESET_ERROR",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_9",
+    "source": "F4_NOTIFY_RADARR",
+    "sourceHandle": "1",
+    "target": "F4_PLEX_MOVIE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_10",
+    "source": "F4_NOTIFY_RADARR",
+    "sourceHandle": "2",
+    "target": "F4_PLEX_MOVIE",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_11",
+    "source": "F4_PLEX_MOVIE",
+    "sourceHandle": "1",
+    "target": "F4_RESET_ERROR",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_12",
+    "source": "F4_PLEX_MOVIE",
+    "sourceHandle": "2",
+    "target": "F4_RESET_ERROR",
+    "animated": true,
+    "type": "smoothstep"
+   },
+   {
+    "id": "e4_err1",
+    "source": "F4_ERROR_HANDLER",
+    "sourceHandle": "1",
+    "target": "F4_HARD_FAIL",
+    "animated": true,
+    "type": "smoothstep"
+   }
+  ],
+  "isUiLocked": false
+ }
+]

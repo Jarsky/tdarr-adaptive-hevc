@@ -1,0 +1,149 @@
+{
+  "_id": "adaptive_hevc_2_encode",
+  "name": "Adaptive HEVC - 2 Encode",
+  "priority": 11,
+  "isUiLocked": false,
+  "flowPlugins": [
+    {
+      "name": "Input File",
+      "sourceRepo": "Community",
+      "pluginName": "inputFile",
+      "version": "1.0.0",
+      "inputsDB": {
+        "fileAccessChecks": "false",
+        "pauseNodeIfAccessChecksFail": "false"
+      },
+      "fpEnabled": true,
+      "id": "F2_INPUT",
+      "position": {
+        "x": 760,
+        "y": 0
+      }
+    },
+    {
+      "name": "Begin FFmpeg Command",
+      "sourceRepo": "Community",
+      "pluginName": "ffmpegCommandStart",
+      "version": "1.0.0",
+      "inputsDB": {},
+      "fpEnabled": true,
+      "id": "F2_START",
+      "position": {
+        "x": 760,
+        "y": 150
+      }
+    },
+    {
+      "name": "Build Encode (x265 CRF + conform streams + MKV)",
+      "sourceRepo": "Community",
+      "pluginName": "customFunction",
+      "version": "1.0.0",
+      "inputsDB": {
+        "code": "// Adaptive HEVC — build the single encode command (flow 2, after \"Begin FFmpeg Command\").\n// Everything v7's separate Conform pass did, plus the conform needs found by Source Profile, in one encode:\n//   video: libx265 CRF (CPU) or hevc_nvenc CQ (GPU) at the Quality Report's value, 10-bit, same\n//          arguments as the report's samples; deinterlace / even-crop filter when needed\n//   input: regenerate timestamps for AVI / MPEG-PS / TS sources\n//   audio: copy, except PCM variants MKV can't hold -> FLAC\n//   subtitles: mov_text/webvtt/text -> SRT, image + SRT/ASS copied, unsupported dropped\n//   data streams and cover art dropped, fonts kept | order video, audio, subtitle, attachment | MKV\nmodule.exports = async (args) => {\n  const cmd = args.variables.ffmpegCommand;\n  const user = args.variables.user || {};\n  const log = (m) => args.jobLog(`[build encode] ${m}`);\n  const q = user.encode_quality;\n  if (!q) throw new Error('encode_quality is not set - the Quality Report (flow 1) did not run');\n  const nvenc = user.encoder === 'hevc_nvenc';\n  const vKbps = parseFloat(user.src_kbps) || 0;\n\n  const toSrt = ['mov_text', 'webvtt', 'text', 'tx3g'];\n  const copySubs = ['subrip', 'srt', 'ass', 'ssa', 'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'];\n  const flacAudio = String(user.conform_audio_flac || '').split(',').filter(Boolean).map(Number);\n  const rank = { video: 0, audio: 1, subtitle: 2, attachment: 3 };\n  let videoSet = false;\n  const notes = [];\n\n  for (const s of cmd.streams) {\n    const type = s.codec_type;\n    const coverArt = s.disposition && Number(s.disposition.attached_pic) === 1;\n    if (type === 'video' && !coverArt && !videoSet) {\n      videoSet = true;\n      if (user.conform_filter) s.outputArgs.push('-filter:{outputIndex}', user.conform_filter);\n      if (nvenc) {\n        s.outputArgs.push('-c:{outputIndex}', 'hevc_nvenc', '-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-cq', q, '-b:v', '0',\n          '-profile:{outputIndex}', 'main10', '-pix_fmt:{outputIndex}', 'p010le');\n        if (vKbps) s.outputArgs.push('-maxrate', `${Math.round(vKbps)}k`, '-bufsize', `${Math.round(vKbps * 2)}k`);\n      } else {\n        s.outputArgs.push('-c:{outputIndex}', 'libx265', '-crf', q, '-preset', 'slow',\n          '-profile:{outputIndex}', 'main10', '-pix_fmt:{outputIndex}', 'yuv420p10le');\n        if (user.x265_params) s.outputArgs.push('-x265-params', user.x265_params);\n      }\n    } else if (coverArt || type === 'data') {\n      s.removed = true; notes.push(`drop #${s.index} ${coverArt ? 'cover art' : 'data'} (${s.codec_name || '?'})`);\n    } else if (type === 'audio' && flacAudio.includes(s.index)) {\n      s.outputArgs.push('-c:{outputIndex}', 'flac'); notes.push(`audio #${s.index} ${s.codec_name} -> flac`);\n    } else if (type === 'subtitle') {\n      if (toSrt.includes(s.codec_name)) { s.outputArgs.push('-c:{outputIndex}', 'srt'); notes.push(`sub #${s.index} ${s.codec_name} -> srt`); }\n      else if (!copySubs.includes(s.codec_name)) { s.removed = true; notes.push(`drop #${s.index} subtitle ${s.codec_name || 'unknown'} (not muxable to MKV)`); }\n    }\n  }\n  if (!videoSet) throw new Error('no video stream to encode');\n\n  if (user.conform_genpts === 'true') cmd.overallInputArguments.push('-fflags', '+genpts');\n  cmd.streams.sort((a, b) => (rank[a.codec_type] ?? 9) - (rank[b.codec_type] ?? 9));\n  cmd.container = 'mkv';\n  cmd.shouldProcess = true;\n  cmd.overallOuputArguments.push('-max_muxing_queue_size', '9999');\n  log(`attempt ${user.encode_attempt || 1}: ${nvenc ? `NVENC CQ ${q}` : `x265 CRF ${q} slow`}, 10-bit${user.conform_filter ? `, filter ${user.conform_filter}` : ''}${user.conform_genpts === 'true' ? ', regenerate timestamps' : ''}`);\n  if (notes.length) log(notes.join('; '));\n  return { outputFileObj: args.inputFileObj, outputNumber: 1, variables: args.variables };\n};\n"
+      },
+      "fpEnabled": true,
+      "id": "F2_BUILD",
+      "position": {
+        "x": 760,
+        "y": 300
+      }
+    },
+    {
+      "name": "Execute Encode (single pass)",
+      "sourceRepo": "Community",
+      "pluginName": "ffmpegCommandExecute",
+      "version": "1.0.0",
+      "inputsDB": {},
+      "fpEnabled": true,
+      "id": "F2_EXECUTE",
+      "position": {
+        "x": 760,
+        "y": 450
+      }
+    },
+    {
+      "name": "→ Go To Flow 3: Verify",
+      "sourceRepo": "Community",
+      "pluginName": "goToFlow",
+      "version": "2.0.0",
+      "inputsDB": {
+        "flowId": "adaptive_hevc_3_verify",
+        "pluginId": "F3_INPUT"
+      },
+      "fpEnabled": true,
+      "id": "F2_GOTO_VERIFY",
+      "position": {
+        "x": 760,
+        "y": 600
+      }
+    },
+    {
+      "name": "On Flow Error",
+      "sourceRepo": "Community",
+      "pluginName": "onFlowError",
+      "version": "1.0.0",
+      "inputsDB": null,
+      "fpEnabled": true,
+      "id": "F2_ERROR_HANDLER",
+      "position": {
+        "x": 1200,
+        "y": 0
+      }
+    },
+    {
+      "name": "Hard Fail",
+      "sourceRepo": "Community",
+      "pluginName": "failFlow",
+      "version": "1.0.0",
+      "inputsDB": null,
+      "fpEnabled": true,
+      "id": "F2_HARD_FAIL",
+      "position": {
+        "x": 1200,
+        "y": 120
+      }
+    }
+  ],
+  "flowEdges": [
+    {
+      "id": "e1",
+      "source": "F2_INPUT",
+      "sourceHandle": "1",
+      "target": "F2_START",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e2",
+      "source": "F2_START",
+      "sourceHandle": "1",
+      "target": "F2_BUILD",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e3",
+      "source": "F2_BUILD",
+      "sourceHandle": "1",
+      "target": "F2_EXECUTE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4",
+      "source": "F2_EXECUTE",
+      "sourceHandle": "1",
+      "target": "F2_GOTO_VERIFY",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e5",
+      "source": "F2_ERROR_HANDLER",
+      "sourceHandle": "1",
+      "target": "F2_HARD_FAIL",
+      "animated": true,
+      "type": "smoothstep"
+    }
+  ]
+}

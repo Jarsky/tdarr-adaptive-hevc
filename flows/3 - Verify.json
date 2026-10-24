@@ -1,0 +1,215 @@
+{
+  "_id": "adaptive_hevc_3_verify",
+  "name": "Adaptive HEVC - 3 Verify",
+  "priority": 12,
+  "isUiLocked": false,
+  "flowPlugins": [
+    {
+      "name": "Input File",
+      "sourceRepo": "Community",
+      "pluginName": "inputFile",
+      "version": "1.0.0",
+      "inputsDB": {
+        "fileAccessChecks": "false",
+        "pauseNodeIfAccessChecksFail": "false"
+      },
+      "fpEnabled": true,
+      "id": "F3_INPUT",
+      "position": {
+        "x": 760,
+        "y": 0
+      }
+    },
+    {
+      "name": "Verify (HEVC, duration, audio, size) -> ok / keep original / retry",
+      "sourceRepo": "Community",
+      "pluginName": "customFunction",
+      "version": "1.0.0",
+      "inputsDB": {
+        "code": "// Adaptive HEVC — verify the encode before anything replaces the original (flow 3).\n// Output 1 = good -> replace + notify\n// Output 2 = keep original (broken encode, or still out of range after the allowed retries)\n// Output 3 = retry: re-encode once more with a corrected quality value (counter: encode_attempt,\n//            limit: v8_max_retries, default 1). The correction uses the REAL full-file result, so a\n//            single retry is normally enough.\nconst { execFile } = require('child_process');\nconst fs = require('fs');\n\n// Whole-file window (target 50%, never below 40%): retry outside 37-70%; after the retries a file\n// between 70% and 85% is still accepted (it saved space), anything else keeps the original.\nconst RETRY_ABOVE = 0.70;      // further from the 50% target than the samples should ever miss by\nconst ACCEPT_UP_TO = 0.85;     // after retries: still worth replacing if it saves 15%+\nconst GRACE = 0.03;            // sample-based estimates: allow 37% before calling it \"below 40%\"\nconst BROKEN_BELOW = 0.10;     // smaller than this is a broken encode, not \"too good\"\n\nfunction probe(ffprobe, file) {\n  return new Promise((resolve, reject) => execFile(ffprobe, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file],\n    { maxBuffer: 32 * 1024 * 1024 }, (e, out) => (e ? reject(e) : resolve(JSON.parse(String(out))))));\n}\nfunction userVar(args, name, dflt) {\n  const lib = (args.userVariables && args.userVariables.library) || {};\n  const glob = (args.userVariables && args.userVariables.global) || {};\n  const n = parseFloat(lib[name] !== undefined && lib[name] !== '' ? lib[name] : glob[name]);\n  return Number.isFinite(n) ? n : dflt;\n}\n\nmodule.exports = async (args) => {\n  const user = args.variables.user || {};\n  const log = (m) => args.jobLog(`[verify] ${m}`);\n  const ffprobe = args.ffProbePath || 'tdarr-ffprobe';\n  const result = (n) => ({ outputFileObj: args.inputFileObj, outputNumber: n, variables: args.variables });\n  const keep = (why) => { log(`KEEP ORIGINAL - ${why}`); return result(2); };\n\n  const out = args.inputFileObj._id;\n  const outBytes = fs.statSync(out).size;\n  const srcBytes = parseFloat(user.src_bytes) || 0;\n  const srcVideo = parseFloat(user.src_video_bytes) || srcBytes * 0.85;\n  const info = await probe(ffprobe, out);\n  const v = (info.streams || []).find((s) => s.codec_type === 'video');\n  const audio = (info.streams || []).filter((s) => s.codec_type === 'audio').length;\n  const dur = parseFloat(info.format.duration) || 0;\n  const srcDur = parseFloat(user.src_duration) || 0;\n\n  // integrity: never retried, the problem isn't the quality value\n  if (!v || v.codec_name !== 'hevc') return keep(`output video is ${v ? v.codec_name : 'missing'}, expected hevc`);\n  if (srcDur && Math.abs(dur - srcDur) > Math.max(2, srcDur * 0.005)) return keep(`duration ${dur.toFixed(1)} s vs source ${srcDur.toFixed(1)} s (truncated encode?)`);\n  if (user.src_audio_count && audio !== parseInt(user.src_audio_count, 10)) return keep(`${audio} audio tracks vs ${user.src_audio_count} in source`);\n  if (!srcBytes) return keep('source size unknown');\n\n  const fileRatio = outBytes / srcBytes;\n  const videoRatio = Math.max(0.001, (outBytes - (srcBytes - srcVideo)) / srcVideo);   // audio/subs are copied\n  const target = parseFloat(user.report_target) || 0.5;   // video-stream target (for the correction maths)\n  const fileMin = parseFloat(user.report_file_min) || 0.40;\n  const attempt = parseInt(user.encode_attempt || '1', 10);\n  const maxRetries = userVar(args, 'v8_max_retries', 1);\n  const q = parseInt(user.encode_quality, 10);\n  log(`attempt ${attempt}: file ${(fileRatio * 100).toFixed(1)}% of original (report predicted ~${(parseFloat(user.report_file_ratio || 0) * 100).toFixed(0)}%, target ${(parseFloat(user.report_file_target || 0.5) * 100).toFixed(0)}%, min ${(fileMin * 100).toFixed(0)}%) at ${user.encoder === 'hevc_nvenc' ? 'CQ' : 'CRF'} ${q}`);\n\n  if (fileRatio < BROKEN_BELOW) return keep(`output is suspiciously small (${(fileRatio * 100).toFixed(1)}%)`);\n  const tooFar = fileRatio < fileMin - GRACE;\n  const tooBig = fileRatio > RETRY_ABOVE;\n  if (!tooBig && !tooFar) { user.result_file_ratio = fileRatio.toFixed(3); log('OK'); return result(1); }\n\n  const why = tooBig ? `file is ${(fileRatio * 100).toFixed(1)}%, well above the 50% target` : `shrank too far (${(fileRatio * 100).toFixed(1)}% < ${(fileMin * 100).toFixed(0)}% minimum)`;\n  if (attempt > maxRetries) {\n    if (tooBig && fileRatio <= ACCEPT_UP_TO) { user.result_file_ratio = fileRatio.toFixed(3); log(`ACCEPT - ${why}, but retries are used up and it still saves ${((1 - fileRatio) * 100).toFixed(0)}%`); return result(1); }\n    return keep(`${why}; ${attempt - 1} retr${attempt - 1 === 1 ? 'y' : 'ies'} used (limit ${maxRetries})`);\n  }\n\n  // corrected quality from the real result: ~slope steps per halving of size\n  const slope = parseFloat(user.report_slope) || 6;\n  const lo = parseInt(user.report_q_lo || '16', 10); const hi = parseInt(user.report_q_hi || '34', 10);\n  let next = Math.round(q + slope * Math.log2(videoRatio / target));\n  if (next === q) next = tooBig ? q + 1 : q - 1;\n  next = Math.max(lo, Math.min(hi, next));\n  if (next === q) return keep(`${why}; quality value already at its limit (${q})`);\n  user.encode_quality = String(next);\n  user.encode_attempt = String(attempt + 1);\n  log(`RETRY ${attempt}/${maxRetries} - ${why}; ${q} -> ${next}`);\n  return result(3);\n};\n"
+      },
+      "fpEnabled": true,
+      "id": "F3_VERIFY",
+      "position": {
+        "x": 760,
+        "y": 150
+      }
+    },
+    {
+      "name": "→ Go To Flow 4: Replace + Notify",
+      "sourceRepo": "Community",
+      "pluginName": "goToFlow",
+      "version": "2.0.0",
+      "inputsDB": {
+        "flowId": "adaptive_hevc_4_notify",
+        "pluginId": "F4_INPUT"
+      },
+      "fpEnabled": true,
+      "id": "F3_GOTO_NOTIFY",
+      "position": {
+        "x": 600,
+        "y": 320
+      }
+    },
+    {
+      "name": "Keep Original: Delete Encode",
+      "sourceRepo": "Community",
+      "pluginName": "deleteFile",
+      "version": "1.0.0",
+      "inputsDB": {},
+      "fpEnabled": true,
+      "id": "F3_DELETE",
+      "position": {
+        "x": 920,
+        "y": 320
+      }
+    },
+    {
+      "name": "Keep Original: Restore",
+      "sourceRepo": "Community",
+      "pluginName": "setOriginalFile",
+      "version": "1.0.0",
+      "inputsDB": {},
+      "fpEnabled": true,
+      "id": "F3_RESTORE",
+      "position": {
+        "x": 920,
+        "y": 470
+      }
+    },
+    {
+      "name": "Retry: Delete Encode",
+      "sourceRepo": "Community",
+      "pluginName": "deleteFile",
+      "version": "1.0.0",
+      "inputsDB": {},
+      "fpEnabled": true,
+      "id": "F3_RETRY_DELETE",
+      "position": {
+        "x": 1240,
+        "y": 320
+      }
+    },
+    {
+      "name": "Retry: Restore Original",
+      "sourceRepo": "Community",
+      "pluginName": "setOriginalFile",
+      "version": "1.0.0",
+      "inputsDB": {},
+      "fpEnabled": true,
+      "id": "F3_RETRY_RESTORE",
+      "position": {
+        "x": 1240,
+        "y": 470
+      }
+    },
+    {
+      "name": "Retry: → Re-Encode (Flow 2)",
+      "sourceRepo": "Community",
+      "pluginName": "goToFlow",
+      "version": "2.0.0",
+      "inputsDB": {
+        "flowId": "adaptive_hevc_2_encode",
+        "pluginId": "F2_INPUT"
+      },
+      "fpEnabled": true,
+      "id": "F3_RETRY_GOTO",
+      "position": {
+        "x": 1240,
+        "y": 620
+      }
+    },
+    {
+      "name": "On Flow Error",
+      "sourceRepo": "Community",
+      "pluginName": "onFlowError",
+      "version": "1.0.0",
+      "inputsDB": null,
+      "fpEnabled": true,
+      "id": "F3_ERROR_HANDLER",
+      "position": {
+        "x": 1200,
+        "y": 0
+      }
+    },
+    {
+      "name": "Hard Fail",
+      "sourceRepo": "Community",
+      "pluginName": "failFlow",
+      "version": "1.0.0",
+      "inputsDB": null,
+      "fpEnabled": true,
+      "id": "F3_HARD_FAIL",
+      "position": {
+        "x": 1200,
+        "y": 120
+      }
+    }
+  ],
+  "flowEdges": [
+    {
+      "id": "e1",
+      "source": "F3_INPUT",
+      "sourceHandle": "1",
+      "target": "F3_VERIFY",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e2",
+      "source": "F3_VERIFY",
+      "sourceHandle": "1",
+      "target": "F3_GOTO_NOTIFY",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e3",
+      "source": "F3_VERIFY",
+      "sourceHandle": "2",
+      "target": "F3_DELETE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e4",
+      "source": "F3_VERIFY",
+      "sourceHandle": "3",
+      "target": "F3_RETRY_DELETE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e5",
+      "source": "F3_DELETE",
+      "sourceHandle": "1",
+      "target": "F3_RESTORE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e6",
+      "source": "F3_RETRY_DELETE",
+      "sourceHandle": "1",
+      "target": "F3_RETRY_RESTORE",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e7",
+      "source": "F3_RETRY_RESTORE",
+      "sourceHandle": "1",
+      "target": "F3_RETRY_GOTO",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "id": "e8",
+      "source": "F3_ERROR_HANDLER",
+      "sourceHandle": "1",
+      "target": "F3_HARD_FAIL",
+      "animated": true,
+      "type": "smoothstep"
+    }
+  ]
+}
